@@ -16,6 +16,11 @@ import (
 	"golang.org/x/oauth2"
 )
 
+const (
+	DefaultTokenURL = "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+	DefaultApiURL   = "https://api.access.redhat.com/management/v1/subscriptions"
+)
+
 var (
 	SubscriptionInfoGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "redhat_subscription_info",
@@ -75,9 +80,8 @@ type errorResponse struct {
 	} `json:"error"`
 }
 
-// FetchAllSubscriptions fetches all pages of subscriptions
-func FetchAllSubscriptions(client *http.Client) ([]Subscription, error) {
-	baseURL := "https://api.access.redhat.com/management/v1/subscriptions"
+// FetchAllSubscriptions fetches all subscriptions
+func FetchAllSubscriptions(client *http.Client, baseURL string) ([]Subscription, error) {
 	limit := 50
 	offset := 0
 	var allSubs []Subscription
@@ -92,13 +96,11 @@ func FetchAllSubscriptions(client *http.Client) ([]Subscription, error) {
 
 		bodyBytes, _ := io.ReadAll(resp.Body)
 
-		// First check for an error payload
 		var errResp errorResponse
 		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error.Message != "" {
 			return nil, fmt.Errorf("API error %d: %s", errResp.Error.Code, errResp.Error.Message)
 		}
 
-		// Parse success response
 		var result subscriptionsResponse
 		if err := json.Unmarshal(bodyBytes, &result); err != nil {
 			return nil, fmt.Errorf("decode failed: %w", err)
@@ -106,7 +108,6 @@ func FetchAllSubscriptions(client *http.Client) ([]Subscription, error) {
 
 		allSubs = append(allSubs, result.Body...)
 
-		// Stop if last page
 		if len(result.Body) < limit {
 			break
 		}
@@ -116,30 +117,24 @@ func FetchAllSubscriptions(client *http.Client) ([]Subscription, error) {
 	return allSubs, nil
 }
 
-func metricsLoop() {
-	offlineToken := os.Getenv("OFFLINE_TOKEN")
-	if offlineToken == "" {
-		fmt.Println("OFFLINE_TOKEN env variable not set")
-		return
-	}
-
+func metricsLoop(token, tokenUrl, apiUrl string, interval int64) {
 	ctx := context.Background()
 
 	conf := &oauth2.Config{
 		ClientID: "rhsm-api",
 		Endpoint: oauth2.Endpoint{
-			TokenURL: "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token",
+			TokenURL: tokenUrl,
 		},
 	}
 
-	ts := conf.TokenSource(ctx, &oauth2.Token{RefreshToken: offlineToken})
+	ts := conf.TokenSource(ctx, &oauth2.Token{RefreshToken: token})
 
 	// Create an HTTP client that injects the Bearer token automatically
 	client := oauth2.NewClient(ctx, ts)
 
 	go func() {
 		for {
-			subs, err := FetchAllSubscriptions(client)
+			subs, err := FetchAllSubscriptions(client, apiUrl)
 			if err != nil {
 				panic(err)
 			}
@@ -155,13 +150,36 @@ func metricsLoop() {
 				SubscriptionEndGauge.With(prometheus.Labels{"subscriptionNumber": s.SubscriptionNumber}).Set(float64(s.EndDate.Unix()))
 			}
 
-			time.Sleep(30 * time.Second)
+			time.Sleep(time.Duration(interval) * time.Second)
 		}
 	}()
 }
 
+func getEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int64) int64 {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
+
 func main() {
-	metricsLoop()
+	token := getEnv("RH_OFFLINE_TOKEN", "")
+	if token == "" {
+		fmt.Println("Please set RH_OFFLINE_TOKEN.")
+		os.Exit(1)
+	}
+
+	metricsLoop(token, getEnv("RH_TOKEN_URL", DefaultTokenURL), getEnv("RH_API_URL", DefaultApiURL), getEnvInt("RH_FETCH_INTERVAL", 30))
 	http.Handle("/metrics", promhttp.Handler())
+	fmt.Println("Listening on :2112")
 	http.ListenAndServe(":2112", nil)
 }
