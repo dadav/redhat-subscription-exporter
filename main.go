@@ -225,10 +225,10 @@ func getEnvInt(key string, fallback int64) int64 {
 }
 
 func init() {
-	flag.StringVar(&exportToFile, "export", "", "Export json to given file")
-	flag.StringVar(&importUrl, "import-url", "", "Import data from url")
-	flag.StringVar(&importUsername, "import-username", "", "Username for import-url")
-	flag.StringVar(&importPassword, "import-password", "", "Password for import-url")
+	flag.StringVar(&exportToFile, "export", os.Getenv("RH_EXPORT_FILE"), "Export json to given file")
+	flag.StringVar(&importUrl, "import-url", os.Getenv("RH_IMPORT_URL"), "Import data from remote json file")
+	flag.StringVar(&importUsername, "import-username", os.Getenv("RH_IMPORT_USERNAME"), "Username for -import-url")
+	flag.StringVar(&importPassword, "import-password", os.Getenv("RH_IMPORT_PASSWORD"), "Password for -import-url")
 	flag.Parse()
 }
 
