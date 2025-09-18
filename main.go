@@ -98,9 +98,18 @@ func FetchAllSubscriptions(client *http.Client, baseURL string) ([]Subscription,
 		if err != nil {
 			return nil, fmt.Errorf("request failed: %w", err)
 		}
-		defer resp.Body.Close()
 
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		// Check HTTP status code
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP error: %d %s", resp.StatusCode, resp.Status)
+		}
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close() // Close immediately after reading
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %w", err)
+		}
 
 		var errResp errorResponse
 		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error.Message != "" {
@@ -149,15 +158,19 @@ func metricsLoop(token, tokenUrl, apiUrl, export, jsonUrl, jsonUser, jsonPass st
 			var subs []Subscription
 			var err error
 
-			if importUrl == "" {
+			if jsonUrl == "" { // Fixed: use parameter instead of global variable
 				subs, err = FetchAllSubscriptions(client, apiUrl)
 				if err != nil {
-					log.Fatal(err)
+					log.Printf("Error fetching subscriptions: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue // Continue loop instead of fatal exit
 				}
 			} else {
 				req, err := http.NewRequest("GET", jsonUrl, nil)
 				if err != nil {
-					log.Fatal(err)
+					log.Printf("Error creating request: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
 				}
 
 				if jsonUser != "" && jsonPass != "" {
@@ -165,15 +178,30 @@ func metricsLoop(token, tokenUrl, apiUrl, export, jsonUrl, jsonUser, jsonPass st
 				}
 				resp, err := client.Do(req)
 				if err != nil {
-					log.Fatal(err)
+					log.Printf("Error making request: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
 				}
-				defer resp.Body.Close()
+
+				// Check HTTP status code
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					resp.Body.Close()
+					log.Printf("HTTP error: %d %s", resp.StatusCode, resp.Status)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
+				}
+
 				body, err := io.ReadAll(resp.Body)
+				resp.Body.Close() // Close immediately after reading
 				if err != nil {
-					log.Fatal(err)
+					log.Printf("Error reading response body: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
 				}
 				if err := json.Unmarshal(body, &subs); err != nil {
-					log.Fatal(err)
+					log.Printf("Error unmarshaling JSON: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
 				}
 			}
 
@@ -195,6 +223,7 @@ func metricsLoop(token, tokenUrl, apiUrl, export, jsonUrl, jsonUser, jsonPass st
 			for _, s := range subs {
 				quantity, err := strconv.ParseFloat(s.Quantity, 64)
 				if err != nil {
+					log.Printf("Error parsing quantity for subscription %s: %v", s.SubscriptionNumber, err)
 					continue
 				}
 				SubscriptionInfoGauge.With(prometheus.Labels{"contractNumber": s.ContractNumber, "subscriptionNumber": s.SubscriptionNumber, "subscriptionName": s.SubscriptionName, "status": s.Status, "sku": s.SKU}).Set(1)
