@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -22,6 +24,10 @@ const (
 )
 
 var (
+	exportToFile          string
+	importUrl             string
+	importUsername        string
+	importPassword        string
 	SubscriptionInfoGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "redhat_subscription_info",
 		Help: "Contains info about subscriptions as labels.",
@@ -92,9 +98,18 @@ func FetchAllSubscriptions(client *http.Client, baseURL string) ([]Subscription,
 		if err != nil {
 			return nil, fmt.Errorf("request failed: %w", err)
 		}
-		defer resp.Body.Close()
 
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		// Check HTTP status code
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP error: %d %s", resp.StatusCode, resp.Status)
+		}
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %w", err)
+		}
 
 		var errResp errorResponse
 		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error.Message != "" {
@@ -117,31 +132,97 @@ func FetchAllSubscriptions(client *http.Client, baseURL string) ([]Subscription,
 	return allSubs, nil
 }
 
-func metricsLoop(token, tokenUrl, apiUrl string, interval int64) {
-	ctx := context.Background()
+func metricsLoop(token, tokenUrl, apiUrl, export, jsonUrl, jsonUser, jsonPass string, interval int64, done chan error) {
+	var client *http.Client
 
-	conf := &oauth2.Config{
-		ClientID: "rhsm-api",
-		Endpoint: oauth2.Endpoint{
-			TokenURL: tokenUrl,
-		},
+	if jsonUrl == "" {
+		ctx := context.Background()
+
+		conf := &oauth2.Config{
+			ClientID: "rhsm-api",
+			Endpoint: oauth2.Endpoint{
+				TokenURL: tokenUrl,
+			},
+		}
+
+		ts := conf.TokenSource(ctx, &oauth2.Token{RefreshToken: token})
+
+		// Create an HTTP client that injects the Bearer token automatically
+		client = oauth2.NewClient(ctx, ts)
+	} else {
+		client = &http.Client{}
 	}
-
-	ts := conf.TokenSource(ctx, &oauth2.Token{RefreshToken: token})
-
-	// Create an HTTP client that injects the Bearer token automatically
-	client := oauth2.NewClient(ctx, ts)
 
 	go func() {
 		for {
-			subs, err := FetchAllSubscriptions(client, apiUrl)
-			if err != nil {
-				panic(err)
+			var subs []Subscription
+			var err error
+
+			if jsonUrl == "" {
+				subs, err = FetchAllSubscriptions(client, apiUrl)
+				if err != nil {
+					log.Printf("Error fetching subscriptions: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
+				}
+			} else {
+				req, err := http.NewRequest("GET", jsonUrl, nil)
+				if err != nil {
+					log.Printf("Error creating request: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
+				}
+
+				if jsonUser != "" && jsonPass != "" {
+					req.SetBasicAuth(jsonUser, jsonPass)
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("Error making request: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
+				}
+
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					resp.Body.Close()
+					log.Printf("HTTP error: %d %s", resp.StatusCode, resp.Status)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
+				}
+
+				body, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err != nil {
+					log.Printf("Error reading response body: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
+				}
+				if err := json.Unmarshal(body, &subs); err != nil {
+					log.Printf("Error unmarshaling JSON: %v", err)
+					time.Sleep(time.Duration(interval) * time.Second)
+					continue
+				}
+			}
+
+			if export != "" {
+				data, err := json.MarshalIndent(subs, "", "  ")
+				if err != nil {
+					done <- err
+					return
+				}
+				err = os.WriteFile(export, data, 0644)
+				if err != nil {
+					done <- err
+					return
+				}
+				done <- nil
+				return
 			}
 
 			for _, s := range subs {
 				quantity, err := strconv.ParseFloat(s.Quantity, 64)
 				if err != nil {
+					log.Printf("Error parsing quantity for subscription %s: %v", s.SubscriptionNumber, err)
 					continue
 				}
 				SubscriptionInfoGauge.With(prometheus.Labels{"contractNumber": s.ContractNumber, "subscriptionNumber": s.SubscriptionNumber, "subscriptionName": s.SubscriptionName, "status": s.Status, "sku": s.SKU}).Set(1)
@@ -171,6 +252,14 @@ func getEnvInt(key string, fallback int64) int64 {
 	return fallback
 }
 
+func init() {
+	flag.StringVar(&exportToFile, "export", os.Getenv("RH_EXPORT_FILE"), "Export json to given file")
+	flag.StringVar(&importUrl, "import-url", os.Getenv("RH_IMPORT_URL"), "Import data from remote json file")
+	flag.StringVar(&importUsername, "import-username", os.Getenv("RH_IMPORT_USERNAME"), "Username for -import-url")
+	flag.StringVar(&importPassword, "import-password", os.Getenv("RH_IMPORT_PASSWORD"), "Password for -import-url")
+	flag.Parse()
+}
+
 func main() {
 	token := getEnv("RH_OFFLINE_TOKEN", "")
 	if token == "" {
@@ -178,7 +267,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	metricsLoop(token, getEnv("RH_TOKEN_URL", DefaultTokenURL), getEnv("RH_API_URL", DefaultApiURL), getEnvInt("RH_FETCH_INTERVAL", 30))
+	done := make(chan error)
+	metricsLoop(token, getEnv("RH_TOKEN_URL", DefaultTokenURL), getEnv("RH_API_URL", DefaultApiURL), exportToFile, importUrl, importUsername, importPassword, getEnvInt("RH_FETCH_INTERVAL", 30), done)
+
+	if exportToFile != "" {
+		err := <-done
+		if err != nil {
+			log.Fatal(err)
+		}
+		os.Exit(0)
+	}
+
 	http.Handle("/metrics", promhttp.Handler())
 	fmt.Println("Listening on :2112")
 	http.ListenAndServe(":2112", nil)
