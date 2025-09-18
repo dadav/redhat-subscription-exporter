@@ -106,7 +106,7 @@ func FetchAllSubscriptions(client *http.Client, baseURL string) ([]Subscription,
 		}
 
 		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close() // Close immediately after reading
+		resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response body: %w", err)
 		}
@@ -158,12 +158,12 @@ func metricsLoop(token, tokenUrl, apiUrl, export, jsonUrl, jsonUser, jsonPass st
 			var subs []Subscription
 			var err error
 
-			if jsonUrl == "" { // Fixed: use parameter instead of global variable
+			if jsonUrl == "" {
 				subs, err = FetchAllSubscriptions(client, apiUrl)
 				if err != nil {
 					log.Printf("Error fetching subscriptions: %v", err)
 					time.Sleep(time.Duration(interval) * time.Second)
-					continue // Continue loop instead of fatal exit
+					continue
 				}
 			} else {
 				req, err := http.NewRequest("GET", jsonUrl, nil)
@@ -183,7 +183,6 @@ func metricsLoop(token, tokenUrl, apiUrl, export, jsonUrl, jsonUser, jsonPass st
 					continue
 				}
 
-				// Check HTTP status code
 				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 					resp.Body.Close()
 					log.Printf("HTTP error: %d %s", resp.StatusCode, resp.Status)
@@ -192,7 +191,7 @@ func metricsLoop(token, tokenUrl, apiUrl, export, jsonUrl, jsonUser, jsonPass st
 				}
 
 				body, err := io.ReadAll(resp.Body)
-				resp.Body.Close() // Close immediately after reading
+				resp.Body.Close()
 				if err != nil {
 					log.Printf("Error reading response body: %v", err)
 					time.Sleep(time.Duration(interval) * time.Second)
